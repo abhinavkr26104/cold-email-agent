@@ -5,6 +5,14 @@ Ollama. It compares a candidate profile with a job description, drafts a
 personalized email, and runs a bounded grounding-review loop before returning
 the final result.
 
+## Video demo
+
+[Watch or download the Cold Email Agent demo](docs/demo/cold-email-agent-demo.mkv)
+
+The demo shows the Streamlit interface, text/PDF input choices, and cold-email
+generation workflow. If your browser does not play MKV files inline, download
+the linked file and open it with a compatible media player such as VLC.
+
 ## How the workflow works
 
 LangChain supplies the prompts, Ollama model integration, and structured model
@@ -26,7 +34,7 @@ flowchart TD
 
 The analysis and review stages return validated Pydantic objects instead of
 free-form control text. In addition to the model review, deterministic checks
-enforce the 100–150 word range and ensure the candidate's name appears exactly
+enforce the 100-150 word range and ensure the candidate's name appears exactly
 once. Revision is capped at two attempts so the graph cannot loop forever.
 
 ## Features
@@ -37,6 +45,7 @@ once. Revision is capped at two attempts so the graph cannot loop forever.
 - Grounding rules that separate candidate facts from job requirements
 - Bounded automatic revisions
 - Streamlit browser interface
+- Paste text or upload a PDF independently for the candidate profile and job description
 - Reusable Python API and backward-compatible CLI
 - Mocked tests that do not require Ollama
 
@@ -44,9 +53,13 @@ once. Revision is capped at two attempts so the graph cannot loop forever.
 
 ```text
 app.py                 Streamlit interface
+document_input.py      PDF extraction and input-mode validation
+docs/demo/             Project demonstration video
 main.py                Command-line interface
 workflow.py            LangChain prompts and LangGraph workflow
 tests/test_workflow.py Mocked workflow and validation tests
+tests/test_app.py      Streamlit input-mode regression tests
+tests/test_document_input.py PDF extraction tests
 requirements.txt       Runtime dependencies
 requirements-dev.txt   Test dependencies
 ```
@@ -88,9 +101,67 @@ pip install -r requirements-dev.txt
 streamlit run app.py
 ```
 
-Enter the candidate name, company name, candidate profile, and complete job
-description. The UI shows only the finalized email; analysis and review details
-remain internal to the workflow.
+Enter the candidate name and company name, then choose **Paste text** or
+**Upload PDF** independently for the candidate profile and job description.
+Uploaded files must be unencrypted, text-based PDFs no larger than 10 MB;
+image-only scans should be pasted as text after OCR. The UI shows only the
+finalized email, while analysis and review details remain internal.
+
+### Text and PDF input behavior
+
+The candidate profile and job description have separate selectors, so any of
+these combinations work:
+
+- Candidate text and job-description text
+- Candidate PDF and job-description text
+- Candidate text and job-description PDF
+- Candidate PDF and job-description PDF
+
+Selecting **Upload PDF** immediately replaces that section's text box with a
+file uploader. PDF text is extracted locally before it is passed to the graph;
+the original file is not sent anywhere by this application. Scanned PDFs need
+OCR first because the app does not perform image recognition.
+
+## Sample test input
+
+**Candidate name:** `Abhinav Kumar Singh`
+
+**Company name:** `TechNova`
+
+**Candidate profile:**
+
+```text
+Python developer with experience building AI applications using LangChain,
+LangGraph, Flask, SQL, and Ollama. Built an injury classification system using
+deep learning and developed a cold-email generation agent with a multi-stage
+review workflow. Comfortable developing backend APIs, integrating language
+models, working with structured outputs, and writing automated tests for Python
+applications.
+```
+
+**Job description:**
+
+```text
+TechNova is seeking a Python Software Engineering Intern to join its Applied AI
+engineering team. The intern will work with software engineers and machine
+learning practitioners to design, develop, test, and maintain applications that
+use artificial intelligence in internal workflows and customer-facing products.
+
+The selected candidate will contribute to backend services written in Python,
+assist with REST API development, and help integrate large language models into
+production-oriented software. Responsibilities also include creating reusable
+components, reviewing technical requirements, debugging application issues,
+documenting technical decisions, and writing automated tests.
+
+Candidates should have practical Python experience through coursework,
+internships, personal projects, or open-source contributions. Familiarity with
+Flask, SQL databases, API development, automated testing, LangChain, LangGraph,
+or locally hosted language models is beneficial. Experience building an
+AI-related project or integrating an LLM into an application is an advantage.
+```
+
+The same sample can be pasted directly or saved as text-based PDFs to exercise
+both input modes.
 
 ## Run the CLI
 
@@ -128,4 +199,5 @@ pytest
 ```
 
 The tests inject deterministic LangChain runnables and cover direct approval,
-revision routing, the retry cap, deterministic validation, and output cleaning.
+revision routing, the retry cap, deterministic validation, output cleaning, PDF
+extraction failures, and immediate Streamlit uploader rendering.

@@ -2,4 +2,5 @@ langchain
 langchain-ollama
 langgraph
 pydantic
+pypdf
 streamlit
