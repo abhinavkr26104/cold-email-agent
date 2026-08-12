@@ -7,11 +7,11 @@ the final result.
 
 ## Video demo
 
-[Watch or download the Cold Email Agent demo](docs/demo/cold-email-agent-demo.mkv)
+[![Cold Email Agent video demo](docs/demo/cold-email-agent-demo.gif)](docs/demo/cold-email-agent-demo.mkv)
 
-The demo shows the Streamlit interface, text/PDF input choices, and cold-email
-generation workflow. If your browser does not play MKV files inline, download
-the linked file and open it with a compatible media player such as VLC.
+The preview plays automatically. Click it to watch or download the full-quality
+demo, which shows the Streamlit interface, text/PDF inputs, and generation
+workflow.
 
 ## How the workflow works
 
