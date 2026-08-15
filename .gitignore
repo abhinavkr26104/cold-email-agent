@@ -1,5 +1,19 @@
+# Virtual environments and Python caches
 venv/
+.venv/
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+
+# Local configuration and credentials
 .env
+.env.*
+!.env.example
+.secrets/
+
+# Runtime data
+data/
+*.db
+
+# Editor settings
 .vscode/

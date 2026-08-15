@@ -12,10 +12,49 @@ from langchain_core.runnables import Runnable
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field, field_validator
+from dotenv import load_dotenv
+
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 
 DEFAULT_MODEL = "llama3.2"
 DEFAULT_MAX_REVISIONS = 2
+
+
+def create_chat_models(model_name: str | None = None, *, temperature: float = 0.3) -> list[Any]:
+    """Return the configured hosted model followed by the local fallback."""
+
+    models: list[Any] = []
+    groq_key = os.getenv("GROQ_API_KEY")
+    if groq_key:
+        from langchain_groq import ChatGroq
+
+        models.append(
+            ChatGroq(
+                api_key=groq_key,
+                model=model_name or os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
+                temperature=temperature,
+            )
+        )
+    models.append(
+        ChatOllama(
+            model=os.getenv("OLLAMA_MODEL", DEFAULT_MODEL) if groq_key else (model_name or os.getenv("OLLAMA_MODEL", DEFAULT_MODEL)),
+            temperature=temperature,
+        )
+    )
+    return models
+
+
+def create_chat_model(model_name: str | None = None, *, temperature: float = 0.3):
+    """Return the preferred model; retained as a small public provider factory."""
+
+    return create_chat_models(model_name, temperature=temperature)[0]
+
+
+def _with_reliability(primary: Runnable[Any, Any], fallbacks: list[Runnable[Any, Any]]):
+    retried = primary.with_retry(stop_after_attempt=3, wait_exponential_jitter=True)
+    return retried.with_fallbacks(fallbacks) if fallbacks else retried
 
 
 class ColdEmailInput(BaseModel):
@@ -25,6 +64,10 @@ class ColdEmailInput(BaseModel):
     company_name: str
     candidate_profile: str
     job_description: str
+    recipient_name: str = ""
+    recipient_position: str = ""
+    role_title: str = ""
+    applied_at: str = ""
 
     @field_validator("candidate_name", "company_name", "candidate_profile", "job_description")
     @classmethod
@@ -60,6 +103,10 @@ class ColdEmailState(TypedDict, total=False):
     company_name: str
     candidate_profile: str
     job_description: str
+    recipient_name: str
+    recipient_position: str
+    role_title: str
+    applied_at: str
     analysis: CandidateJobAnalysis
     draft_email: str
     review: ReviewResult
@@ -104,6 +151,9 @@ candidate to a recruiter or hiring manager.
 
 Candidate Name: {candidate_name}
 Company Name: {company_name}
+Recipient Name: {recipient_name}
+Recipient Position: {recipient_position}
+Application Timestamp: {applied_at}
 
 Candidate Profile:
 {candidate_profile}
@@ -127,6 +177,8 @@ STRICT RULES:
 - Do not call the candidate seasoned, expert, or experienced unless supported.
 - Avoid generic corporate language such as "drive business growth".
 - Include one specific candidate project when relevant and supported.
+- If a recipient name is supplied, greet that person by first name; otherwise greet the hiring team.
+- State that the candidate applied only when Application Timestamp is non-empty.
 - End with a polite call to action.
 - Include the candidate name exactly once, in the signature.
 - Do not use placeholders or Markdown code fences.
@@ -202,14 +254,18 @@ Return only the revised email.
 def create_dependencies(model: Any | None = None) -> WorkflowDependencies:
     """Create the LangChain runnables used by graph nodes."""
 
-    chat_model = model or ChatOllama(
-        model=os.getenv("OLLAMA_MODEL", DEFAULT_MODEL),
-        temperature=0.3,
-    )
-    analysis_model = chat_model.with_structured_output(
-        CandidateJobAnalysis, method="json_schema"
-    )
-    review_model = chat_model.with_structured_output(ReviewResult, method="json_schema")
+    chat_models = [model] if model is not None else create_chat_models()
+    chat_model = _with_reliability(chat_models[0], chat_models[1:])
+    analysis_candidates = [
+        candidate.with_structured_output(CandidateJobAnalysis, method="json_schema")
+        for candidate in chat_models
+    ]
+    review_candidates = [
+        candidate.with_structured_output(ReviewResult, method="json_schema")
+        for candidate in chat_models
+    ]
+    analysis_model = _with_reliability(analysis_candidates[0], analysis_candidates[1:])
+    review_model = _with_reliability(review_candidates[0], review_candidates[1:])
 
     return WorkflowDependencies(
         analysis_chain=ANALYSIS_PROMPT | analysis_model,
