@@ -95,6 +95,34 @@ CREATE TABLE IF NOT EXISTS outreach (
     created_at TEXT NOT NULL,
     UNIQUE(job_id, recipient)
 );
+CREATE TABLE IF NOT EXISTS drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL UNIQUE REFERENCES jobs(id) ON DELETE CASCADE,
+    subject TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '',
+    profile_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    job_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    contact_snapshot_json TEXT NOT NULL DEFAULT '{}',
+    edited INTEGER NOT NULL DEFAULT 0,
+    stale INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'draft',
+    model_name TEXT NOT NULL DEFAULT '',
+    generated_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS task_runs (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    progress INTEGER NOT NULL DEFAULT 0,
+    result_json TEXT NOT NULL DEFAULT '{}',
+    errors_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS sync_state (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -239,8 +267,29 @@ class Database:
             CASE WHEN contact_source_url IS NULL THEN '[]' ELSE json_array(contact_source_url) END,
             1,first_seen_at FROM jobs WHERE contact_email IS NOT NULL AND contact_email!=''"""
         )
+        # Queued outreach in pre-React databases was both an editable draft and
+        # a delivery record. Preserve its content in the new draft store while
+        # keeping Gmail history immutable in outreach.
         db.execute(
-            "INSERT OR REPLACE INTO schema_meta(key,value) VALUES('schema_version','3')"
+            """INSERT OR IGNORE INTO drafts(
+            job_id,subject,body,contact_snapshot_json,edited,stale,status,model_name,
+            generated_at,updated_at)
+            SELECT job_id,subject,body,
+            json_object('email',recipient,'source_url',recipient_source_url,
+                        'name',contact_name,'position',contact_position,
+                        'confidence',contact_confidence,'source_kind',contact_source_kind,
+                        'sources',json(contact_sources_json)),
+            1,0,CASE WHEN status='queued' THEN 'draft' ELSE status END,'legacy',created_at,created_at
+            FROM outreach"""
+        )
+        # Runs left active by a terminated process are explicit and recoverable.
+        db.execute(
+            """UPDATE task_runs SET status='interrupted',stage='interrupted',finished_at=?,updated_at=?
+            WHERE status IN ('queued','running')""",
+            (utcnow(), utcnow()),
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO schema_meta(key,value) VALUES('schema_version','4')"
         )
 
     @contextmanager
@@ -301,6 +350,22 @@ class Database:
     def set_source_enabled(self, source_id: int, enabled: bool) -> None:
         with self.connect() as db:
             db.execute("UPDATE sources SET enabled=? WHERE id=?", (int(enabled), source_id))
+
+    def update_source(self, source_id: int, values: dict[str, Any]) -> dict[str, Any]:
+        allowed = {"company_name", "enabled"}
+        changes = {key: value for key, value in values.items() if key in allowed}
+        if not changes:
+            raise ValueError("No supported source fields were supplied.")
+        assignments = ",".join(f"{key}=?" for key in changes)
+        with self.connect() as db:
+            changed = db.execute(
+                f"UPDATE sources SET {assignments} WHERE id=?",
+                (*[int(value) if key == "enabled" else str(value).strip() for key, value in changes.items()], source_id),
+            ).rowcount
+            if not changed:
+                raise ValueError("Unknown source.")
+            row = db.execute("SELECT * FROM sources WHERE id=?", (source_id,)).fetchone()
+        return dict(row)
 
     def upsert_jobs(self, source_id: int, jobs: list[dict[str, Any]]) -> int:
         now = utcnow()
@@ -437,6 +502,225 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_matches(
+        self, *, status: str | None = None, minimum_score: int | None = None,
+        company: str | None = None, limit: int = 25, offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        clauses = ["1=1"]
+        values: list[Any] = []
+        if status:
+            clauses.append("jobs.status=?")
+            values.append(status)
+        if minimum_score is not None:
+            clauses.append("matches.score>=?")
+            values.append(minimum_score)
+        if company:
+            clauses.append("lower(jobs.company_name) LIKE lower(?)")
+            values.append(f"%{company.strip()}%")
+        where = " AND ".join(clauses)
+        with self.connect() as db:
+            total = int(db.execute(
+                f"SELECT COUNT(*) count FROM matches JOIN jobs ON jobs.id=matches.job_id WHERE {where}",
+                values,
+            ).fetchone()["count"])
+            rows = db.execute(
+                f"""SELECT jobs.*,matches.score,matches.decision,matches.evidence_json,
+                matches.missing_json,matches.rejection_reason,drafts.id AS draft_id,
+                drafts.status AS draft_status,contacts.email AS selected_contact_email
+                FROM matches JOIN jobs ON jobs.id=matches.job_id
+                LEFT JOIN drafts ON drafts.job_id=jobs.id
+                LEFT JOIN contacts ON contacts.job_id=jobs.id AND contacts.selected=1
+                WHERE {where} ORDER BY matches.score DESC,jobs.first_seen_at DESC LIMIT ? OFFSET ?""",
+                (*values, max(1, min(limit, 100)), max(0, offset)),
+            ).fetchall()
+        return [dict(row) for row in rows], total
+
+    def top_qualified_jobs(self, limit: int = 5) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT jobs.*,matches.score,matches.model_name,
+                contacts.email AS selected_contact_email,contacts.name AS contact_name,
+                contacts.position AS contact_position,contacts.confidence AS contact_confidence,
+                contacts.source_kind AS contact_source_kind,contacts.sources_json AS contact_sources_json,
+                drafts.id AS draft_id,drafts.edited AS draft_edited,
+                drafts.contact_snapshot_json AS draft_contact_snapshot_json
+                FROM matches JOIN jobs ON jobs.id=matches.job_id
+                LEFT JOIN contacts ON contacts.job_id=jobs.id AND contacts.selected=1
+                LEFT JOIN drafts ON drafts.job_id=jobs.id
+                WHERE jobs.status='open' AND matches.decision='qualified'
+                ORDER BY matches.score DESC,jobs.first_seen_at DESC LIMIT ?""",
+                (max(1, min(limit, 50)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_draft(
+        self, job_id: int, subject: str, body: str, *, profile_snapshot: dict[str, Any],
+        job_snapshot: dict[str, Any], contact_snapshot: dict[str, Any] | None,
+        model_name: str, force: bool = False,
+    ) -> int:
+        now = utcnow()
+        with self.connect() as db:
+            current = db.execute("SELECT * FROM drafts WHERE job_id=?", (job_id,)).fetchone()
+            if current and current["edited"] and not force:
+                db.execute("UPDATE drafts SET stale=1,updated_at=? WHERE id=?", (now, current["id"]))
+                return int(current["id"])
+            db.execute(
+                """INSERT INTO drafts(job_id,subject,body,profile_snapshot_json,job_snapshot_json,
+                contact_snapshot_json,edited,stale,status,model_name,generated_at,updated_at)
+                VALUES(?,?,?,?,?,?,0,0,'draft',?,?,?)
+                ON CONFLICT(job_id) DO UPDATE SET subject=excluded.subject,body=excluded.body,
+                profile_snapshot_json=excluded.profile_snapshot_json,
+                job_snapshot_json=excluded.job_snapshot_json,
+                contact_snapshot_json=excluded.contact_snapshot_json,edited=0,stale=0,
+                status=CASE WHEN drafts.status='sent' THEN drafts.status ELSE 'draft' END,
+                model_name=excluded.model_name,generated_at=excluded.generated_at,
+                updated_at=excluded.updated_at""",
+                (job_id, subject.strip(), body.strip(), json.dumps(profile_snapshot),
+                 json.dumps(job_snapshot), json.dumps(contact_snapshot or {}), model_name, now, now),
+            )
+            return int(db.execute("SELECT id FROM drafts WHERE job_id=?", (job_id,)).fetchone()["id"])
+
+    def get_draft(self, draft_id: int) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                """SELECT drafts.*,jobs.title,jobs.description,jobs.company_name,jobs.status AS job_status,
+                jobs.application_status,jobs.applied_at,jobs.apply_url,jobs.job_url,
+                contacts.email AS selected_contact_email,contacts.name AS contact_name,
+                contacts.position AS contact_position,contacts.confidence AS contact_confidence,
+                contacts.source_kind AS contact_source_kind,contacts.sources_json AS contact_sources_json
+                FROM drafts JOIN jobs ON jobs.id=drafts.job_id
+                LEFT JOIN contacts ON contacts.job_id=jobs.id AND contacts.selected=1
+                WHERE drafts.id=?""",
+                (draft_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def approval_items(self) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute(
+                """SELECT drafts.*,jobs.title,jobs.description,jobs.company_name,jobs.location,
+                jobs.status AS job_status,jobs.application_status,jobs.applied_at,jobs.apply_url,
+                jobs.job_url,matches.score,matches.evidence_json,matches.missing_json,
+                contacts.email AS selected_contact_email,contacts.name AS contact_name,
+                contacts.position AS contact_position,contacts.confidence AS contact_confidence,
+                contacts.verification_status AS contact_verification_status,
+                contacts.source_kind AS contact_source_kind,contacts.sources_json AS contact_sources_json,
+                (SELECT COUNT(*) FROM outreach o WHERE o.job_id=jobs.id AND o.status IN ('sent','replied','auto_reply')) AS sent_count
+                FROM drafts JOIN jobs ON jobs.id=drafts.job_id
+                JOIN matches ON matches.job_id=jobs.id
+                LEFT JOIN contacts ON contacts.job_id=jobs.id AND contacts.selected=1
+                ORDER BY matches.score DESC,drafts.updated_at DESC"""
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def edit_draft(self, draft_id: int, subject: str, body: str) -> dict[str, Any]:
+        with self.connect() as db:
+            changed = db.execute(
+                """UPDATE drafts SET subject=?,body=?,edited=1,stale=0,updated_at=?
+                WHERE id=? AND status!='sent'""",
+                (subject.strip(), body.strip(), utcnow(), draft_id),
+            ).rowcount
+            if not changed:
+                raise ValueError("Draft was not found or has already been sent.")
+        return self.get_draft(draft_id) or {}
+
+    def mark_draft_stale(self, job_id: int) -> None:
+        with self.connect() as db:
+            db.execute(
+                "UPDATE drafts SET stale=1,updated_at=? WHERE job_id=? AND edited=1 AND status!='sent'",
+                (utcnow(), job_id),
+            )
+
+    def selected_contact(self, job_id: int) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT * FROM contacts WHERE job_id=? AND selected=1", (job_id,)
+            ).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["sources"] = json.loads(result.pop("sources_json") or "[]")
+        return result
+
+    def create_outreach_from_draft(self, draft_id: int) -> int:
+        draft = self.get_draft(draft_id)
+        if not draft:
+            raise ValueError("Unknown draft.")
+        contact = self.selected_contact(draft["job_id"])
+        if not contact or not contact.get("sources"):
+            raise ValueError("A verified contact with source evidence is required.")
+        if draft["application_status"] != "applied":
+            raise ValueError("Mark the job as applied before approving outreach.")
+        self.queue_outreach(
+            draft["job_id"], contact["email"], contact["sources"][0],
+            draft["subject"], draft["body"],
+        )
+        with self.connect() as db:
+            return int(db.execute(
+                "SELECT id FROM outreach WHERE job_id=? AND recipient=?",
+                (draft["job_id"], contact["email"]),
+            ).fetchone()["id"])
+
+    def mark_draft_sent(self, job_id: int) -> None:
+        with self.connect() as db:
+            db.execute(
+                "UPDATE drafts SET status='sent',stale=0,updated_at=? WHERE job_id=?",
+                (utcnow(), job_id),
+            )
+
+    def create_task_run(self, run_id: str, kind: str = "discovery") -> dict[str, Any]:
+        now = utcnow()
+        with self.connect() as db:
+            active = db.execute(
+                "SELECT id FROM task_runs WHERE kind=? AND status IN ('queued','running') LIMIT 1",
+                (kind,),
+            ).fetchone()
+            if active:
+                raise RuntimeError(f"A {kind} run is already active: {active['id']}")
+            db.execute(
+                """INSERT INTO task_runs(id,kind,status,stage,progress,created_at,updated_at)
+                VALUES(?,?,'queued','queued',0,?,?)""",
+                (run_id, kind, now, now),
+            )
+        return self.get_task_run(run_id) or {}
+
+    def update_task_run(
+        self, run_id: str, *, status: str | None = None, stage: str | None = None,
+        progress: int | None = None, result: dict[str, Any] | None = None,
+        errors: list[dict[str, Any]] | None = None,
+    ) -> None:
+        fields = ["updated_at=?"]
+        values: list[Any] = [utcnow()]
+        for name, value in (("status", status), ("stage", stage), ("progress", progress)):
+            if value is not None:
+                fields.append(f"{name}=?")
+                values.append(value)
+        if result is not None:
+            fields.append("result_json=?")
+            values.append(json.dumps(result))
+        if errors is not None:
+            fields.append("errors_json=?")
+            values.append(json.dumps(errors))
+        if status == "running":
+            fields.append("started_at=COALESCE(started_at,?)")
+            values.append(utcnow())
+        if status in {"completed", "failed", "partial", "interrupted"}:
+            fields.append("finished_at=?")
+            values.append(utcnow())
+        values.append(run_id)
+        with self.connect() as db:
+            db.execute(f"UPDATE task_runs SET {','.join(fields)} WHERE id=?", values)
+
+    def get_task_run(self, run_id: str) -> dict[str, Any] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
+        if not row:
+            return None
+        result = dict(row)
+        result["result"] = json.loads(result.pop("result_json") or "{}")
+        result["errors"] = json.loads(result.pop("errors_json") or "[]")
+        return result
+
     def queue_outreach(self, job_id: int, recipient: str, source_url: str, subject: str, body: str) -> None:
         with self.connect() as db:
             job = db.execute(
@@ -517,6 +801,11 @@ class Database:
                 SELECT job_id FROM outreach WHERE id=?)""",
                 (outreach_id,),
             )
+            db.execute(
+                """UPDATE drafts SET status='sent',updated_at=? WHERE job_id=(
+                SELECT job_id FROM outreach WHERE id=?)""",
+                (utcnow(), outreach_id),
+            )
 
     def mark_send_error(self, outreach_id: int, error: str) -> None:
         with self.connect() as db:
@@ -547,7 +836,7 @@ class Database:
                 (SELECT COUNT(*) FROM jobs WHERE status='open') AS open_roles,
                 (SELECT COUNT(*) FROM matches JOIN jobs ON jobs.id=matches.job_id
                     WHERE matches.decision='qualified' AND jobs.status='open') AS qualified,
-                (SELECT COUNT(*) FROM outreach WHERE status='queued') AS queued,
+                (SELECT COUNT(*) FROM drafts WHERE status='draft') AS queued,
                 (SELECT COUNT(*) FROM outreach WHERE status IN ('sent','replied','auto_reply')) AS sent,
                 (SELECT COUNT(*) FROM outreach WHERE status='replied') AS replies,
                 (SELECT COUNT(*) FROM jobs WHERE application_status='applied') AS applied"""
@@ -602,7 +891,7 @@ class Database:
             rows = db.execute(
                 """SELECT jobs.*,matches.score FROM jobs JOIN matches ON matches.job_id=jobs.id
                 LEFT JOIN contacts ON contacts.job_id=jobs.id AND contacts.selected=1
-                WHERE jobs.status='open' AND jobs.application_status='applied'
+                WHERE jobs.status='open'
                 AND matches.decision='qualified' AND matches.score>=? AND contacts.id IS NULL
                 AND NOT EXISTS(SELECT 1 FROM enrichment_attempts ea WHERE ea.job_id=jobs.id
                     AND ea.status IN ('contact_found','no_contact','cached'))

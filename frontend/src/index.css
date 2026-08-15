@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: #080d18; color: #e8eef8; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; min-height: 100vh; background: radial-gradient(circle at 80% -10%, rgba(79,70,229,.18), transparent 34rem), radial-gradient(circle at 5% 40%, rgba(20,184,166,.08), transparent 30rem), #080d18; }
+button, input, textarea, select { font: inherit; }
+button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible { outline: 2px solid #5eead4; outline-offset: 2px; }
+
+@layer components {
+  .panel { @apply rounded-2xl border border-slate-700/50 bg-slate-900/65 shadow-xl shadow-black/10 backdrop-blur; }
+  .input { @apply w-full rounded-xl border border-slate-700 bg-slate-950/60 px-3.5 py-2.5 text-sm text-slate-100 placeholder:text-slate-600 focus:border-teal-400; }
+  .btn { @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-40; }
+  .btn-primary { @apply btn bg-teal-300 text-slate-950 hover:bg-teal-200; }
+  .btn-secondary { @apply btn border border-slate-700 bg-slate-800/70 text-slate-200 hover:border-slate-600 hover:bg-slate-800; }
+  .label { @apply mb-2 block text-xs font-semibold uppercase tracking-widest text-slate-500; }
+  .eyebrow { @apply text-xs font-bold uppercase tracking-[.2em] text-teal-300; }
+}

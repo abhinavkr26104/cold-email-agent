@@ -112,6 +112,7 @@ def evaluate_matches(db: Database, matcher: RoleMatcher | None = None) -> dict[s
 
 
 def enrich_applied_jobs(db: Database, hunter: HunterClient | None = None) -> dict[str, int]:
+    """Enrich the highest-ranked matches (legacy name retained for CLI callers)."""
     totals = {"attempted": 0, "contacts_found": 0, "skipped_quota": 0, "skipped_config": 0}
     remaining_month = MONTHLY_HUNTER_LIMIT - db.hunter_usage()
     remaining_today = DAILY_ENRICHMENT_LIMIT - db.enrichment_attempts_today()
@@ -124,7 +125,7 @@ def enrich_applied_jobs(db: Database, hunter: HunterClient | None = None) -> dic
         totals["skipped_config"] = 1
         return totals
     client = hunter or HunterClient(api_key)
-    for job in db.jobs_for_enrichment(limit=allowance):
+    for job in db.jobs_for_enrichment(minimum_score=0, limit=allowance):
         totals["attempted"] += 1
         cached = db.cached_company_contact(job["company_name"])
         if cached:
@@ -151,6 +152,48 @@ def enrich_applied_jobs(db: Database, hunter: HunterClient | None = None) -> dic
     return totals
 
 
+def find_contact_for_job(
+    db: Database, job_id: int, hunter: HunterClient | None = None,
+) -> dict[str, Any] | None:
+    """Find one sourced contact while enforcing all Hunter limits."""
+
+    existing = db.selected_contact(job_id)
+    if existing:
+        return existing
+    job = next((item for item in db.open_jobs() if item["id"] == job_id), None)
+    if not job:
+        raise ValueError("Only an open role can be enriched.")
+    if db.hunter_usage() >= MONTHLY_HUNTER_LIMIT:
+        raise ValueError("Hunter monthly quota is exhausted.")
+    if db.enrichment_attempts_today() >= DAILY_ENRICHMENT_LIMIT:
+        raise ValueError("Hunter daily quota is exhausted.")
+    cached = db.cached_company_contact(job["company_name"])
+    if cached:
+        db.save_contact(job_id, cached)
+        db.record_enrichment_attempt(job_id, "cached", 0)
+        return db.selected_contact(job_id)
+    api_key = os.getenv("HUNTER_API_KEY", "").strip()
+    if hunter is None and not api_key:
+        raise ValueError("Hunter is not configured.")
+    allowed, retry_after = _reserve(db, "hunter:minute", HUNTER_REQUESTS_PER_MINUTE, 60)
+    if not allowed:
+        raise ValueError(f"Hunter minute limit reached; retry in {retry_after} seconds.")
+    client = hunter or HunterClient(api_key)
+    try:
+        candidates = client.find_recruiting_contacts(job["company_name"])
+    except Exception:
+        db.record_enrichment_attempt(job_id, "failed", 0)
+        raise
+    if not candidates:
+        db.record_enrichment_attempt(job_id, "no_contact", 1)
+        return None
+    contact = dict(candidates[0])
+    contact.pop("selection_score", None)
+    db.save_contact(job_id, contact)
+    db.record_enrichment_attempt(job_id, "contact_found", 1)
+    return db.selected_contact(job_id)
+
+
 def _split_generated_email(email: str, title: str, company: str) -> tuple[str, str]:
     lines = email.strip().splitlines()
     if lines and re.match(r"^subject\s*:", lines[0], re.I):
@@ -159,6 +202,80 @@ def _split_generated_email(email: str, title: str, company: str) -> tuple[str, s
             lines.pop(0)
         return subject, "\n".join(lines).strip()
     return f"Interest in {title} at {company}", email.strip()
+
+
+def prepare_drafts(
+    db: Database, limit: int = 5, *, generator=generate_cold_email,
+    force_job_id: int | None = None,
+) -> int:
+    """Create drafts for the top qualified roles, with or without a contact."""
+
+    profile = db.get_profile()
+    if not profile:
+        raise RuntimeError("Save a candidate profile before preparing drafts.")
+    prepared = 0
+    matches = db.top_qualified_jobs(limit=50 if force_job_id is not None else max(limit, 5))
+    if force_job_id is not None:
+        matches = [match for match in matches if match["id"] == force_job_id]
+        if not matches:
+            raise ValueError("A draft can only be generated for a top qualified open role.")
+    for match in matches[:limit]:
+        if match.get("draft_id") and force_job_id is None:
+            previous_contact = json.loads(match.get("draft_contact_snapshot_json") or "{}")
+            contact_arrived = bool(match.get("selected_contact_email") and not previous_contact.get("email"))
+            if not contact_arrived:
+                continue
+            if match.get("draft_edited"):
+                db.mark_draft_stale(match["id"])
+                continue
+        allowed, _ = _reserve(db, "model:drafting", DAILY_DRAFT_LIMIT, 86_400)
+        if not allowed:
+            break
+        email = generator(
+            ColdEmailInput(
+                candidate_name=profile["candidate_name"],
+                company_name=match["company_name"],
+                candidate_profile=profile["candidate_profile"],
+                job_description=match["description"],
+                recipient_name=match["contact_name"] or "",
+                recipient_position=match["contact_position"] or "",
+                role_title=match["title"],
+                # The prompt may claim an application only after this is set.
+                applied_at=match["applied_at"] or "",
+            )
+        )
+        subject, body = _split_generated_email(email, match["title"], match["company_name"])
+        contact = db.selected_contact(match["id"])
+        db.save_draft(
+            match["id"], subject, body,
+            profile_snapshot={
+                "candidate_name": profile["candidate_name"],
+                "candidate_profile": profile["candidate_profile"],
+                "preferences": profile["preferences"],
+            },
+            job_snapshot={
+                "title": match["title"], "company_name": match["company_name"],
+                "description": match["description"], "fingerprint": match["fingerprint"],
+                "applied_at": match["applied_at"],
+            },
+            contact_snapshot=contact,
+            model_name=match.get("model_name") or os.getenv("GROQ_MODEL", os.getenv("OLLAMA_MODEL", "llama3.2")),
+            force=force_job_id is not None,
+        )
+        prepared += 1
+    return prepared
+
+
+def personalize_draft(
+    db: Database, draft_id: int, *, generator=generate_cold_email,
+) -> dict[str, Any]:
+    draft = db.get_draft(draft_id)
+    if not draft:
+        raise ValueError("Unknown draft.")
+    if not draft.get("selected_contact_email"):
+        raise ValueError("No selected contact is available for personalization.")
+    prepare_drafts(db, limit=1, generator=generator, force_job_id=draft["job_id"])
+    return db.get_draft(draft_id) or {}
 
 
 def prepare_queue(db: Database, limit: int = DAILY_SEND_LIMIT) -> int:
@@ -207,8 +324,10 @@ def run_discovery(db: Database | None = None) -> dict[str, Any]:
     try:
         result: dict[str, Any] = discover(database)
         result.update(evaluate_matches(database))
+        # Published contacts already selected during upsert win; Hunter fills
+        # only the remaining top matches and is still limited to two per day.
         result["enrichment"] = enrich_applied_jobs(database)
-        result["drafts_prepared"] = prepare_queue(database)
+        result["drafts_prepared"] = prepare_drafts(database, limit=5)
         database.record_run("discover", "success", str(result), started)
         return result
     except Exception as error:
@@ -259,6 +378,39 @@ def send_approved(
         except Exception as error:
             database.mark_send_error(outreach_id, str(error))
             result["failed"].append({"id": outreach_id, "error": str(error)})
+    return result
+
+
+def send_drafts(
+    draft_ids: list[int], db: Database | None = None, mailer: GmailProvider | None = None,
+) -> dict[str, Any]:
+    """Freeze approved drafts into delivery snapshots and send them."""
+
+    database = db or Database()
+    outreach_ids: list[int] = []
+    rejected: list[dict[str, Any]] = []
+    for draft_id in list(dict.fromkeys(draft_ids)):
+        draft = database.get_draft(draft_id)
+        if not draft:
+            rejected.append({"id": draft_id, "reason": "Unknown draft"})
+            continue
+        if draft["job_status"] != "open":
+            rejected.append({"id": draft_id, "reason": "Role is closed"})
+            continue
+        if draft["application_status"] != "applied":
+            rejected.append({"id": draft_id, "reason": "Job is not marked applied"})
+            continue
+        if not draft["subject"].strip() or not draft["body"].strip():
+            rejected.append({"id": draft_id, "reason": "Subject and message are required"})
+            continue
+        try:
+            outreach_ids.append(database.create_outreach_from_draft(draft_id))
+        except ValueError as error:
+            rejected.append({"id": draft_id, "reason": str(error)})
+    if not outreach_ids:
+        return {"sent": [], "skipped": rejected, "failed": []}
+    result = send_approved(outreach_ids, database, mailer)
+    result["skipped"] = rejected + result["skipped"]
     return result
 
 

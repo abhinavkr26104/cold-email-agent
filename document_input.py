@@ -49,7 +49,7 @@ def resolve_document_text(
     uploaded_pdf: bytes | None,
     label: str,
 ) -> str:
-    """Resolve one Streamlit input mode to plain text for the graph."""
+    """Resolve one UI input mode to plain text for the graph."""
 
     if method == "Paste text":
         return pasted_text.strip()

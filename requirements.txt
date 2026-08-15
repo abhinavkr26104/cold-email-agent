@@ -4,7 +4,8 @@ langchain-ollama
 langgraph
 pydantic
 pypdf
-streamlit
+fastapi
+uvicorn[standard]
 google-api-python-client
 google-auth-oauthlib
 python-dotenv
