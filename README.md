@@ -1,6 +1,6 @@
 # Scoutly — local job outreach workspace
 
-<video src="https://github.com/user-attachments/assets/f76aed72-a118-4eb0-98dd-11550569ce31" autoplay loop muted playsinline width="800"></video>
+<video src="https://github.com/user-attachments/assets/c9ecbfb0-4f9e-4ff1-908c-7742be9c2685" autoplay loop muted playsinline width="800"></video>
 
 Scoutly is a local-first React and FastAPI application for discovering roles,
 ranking fit, and preparing saved recruiter-email drafts. It keeps all application
