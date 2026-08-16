@@ -6,6 +6,4 @@ pydantic
 pypdf
 fastapi
 uvicorn[standard]
-google-api-python-client
-google-auth-oauthlib
 python-dotenv

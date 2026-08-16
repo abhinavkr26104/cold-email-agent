@@ -3,59 +3,9 @@ from pathlib import Path
 
 import pytest
 
-from automation import discover, enrich_applied_jobs, send_approved, sync_replies
+from automation import discover, enrich_applied_jobs
 from matching import hard_filter
 from storage import Database
-
-
-def seeded_database(tmp_path: Path) -> tuple[Database, int]:
-    db = Database(tmp_path / "agent.db")
-    db.save_profile(
-        "Ada Lovelace",
-        "Python developer who built an API.",
-        {
-            "locations": ["remote"],
-            "employment_types": ["full-time"],
-            "remote_policy": "any",
-            "minimum_score": 70,
-        },
-    )
-    db.add_source("Acme", "lever", "acme", "https://jobs.lever.co/acme")
-    source = db.list_sources()[0]
-    db.upsert_jobs(
-        source["id"],
-        [
-            {
-                "external_id": "role-1",
-                "title": "Python Engineer",
-                "location": "Remote",
-                "employment_type": "Full-time",
-                "description": "Build Python APIs.",
-                "job_url": "https://jobs.lever.co/acme/role-1",
-                "apply_url": "https://jobs.lever.co/acme/role-1/apply",
-                "contact_email": "careers@acme.test",
-                "contact_source_url": "https://jobs.lever.co/acme/role-1",
-            }
-        ],
-    )
-    job = db.open_jobs()[0]
-    db.save_match(
-        job["id"],
-        {
-            "score": 90,
-            "decision": "qualified",
-            "evidence": ["Python"],
-            "missing_requirements": [],
-            "rejection_reason": "",
-            "job_fingerprint": job["fingerprint"],
-        },
-        "fake-model",
-    )
-    db.mark_applied(job["id"])
-    db.queue_outreach(
-        job["id"], "careers@acme.test", "https://jobs.lever.co/acme/role-1", "Python role", "Hello"
-    )
-    return db, db.queued_outreach()[0]["id"]
 
 
 def test_hard_filter_rejects_exclusion_before_model():
@@ -66,60 +16,6 @@ def test_hard_filter_rejects_exclusion_before_model():
 def test_hard_filter_requires_configured_role_keyword():
     job = {"title": "Python Engineer", "location": "Remote", "employment_type": "Full-time", "description": "APIs"}
     assert hard_filter(job, {"required_keywords": ["django"]}) == "Required keyword is missing: django"
-
-
-def test_send_approved_persists_gmail_ids(tmp_path):
-    db, outreach_id = seeded_database(tmp_path)
-
-    class Mailer:
-        def send(self, recipient, subject, body):
-            assert recipient == "careers@acme.test"
-            return {"message_id": "message-1", "thread_id": "thread-1"}
-
-    result = send_approved([outreach_id], db, Mailer())
-
-    assert result["sent"] == [outreach_id]
-    assert db.get_outreach(outreach_id)["status"] == "sent"
-
-
-def test_send_blocks_contact_without_current_provenance(tmp_path):
-    db, outreach_id = seeded_database(tmp_path)
-    with db.connect() as connection:
-        connection.execute("UPDATE jobs SET contact_email=NULL WHERE id=1")
-
-    result = send_approved([outreach_id], db, mailer=object())
-
-    assert result["sent"] == []
-    assert result["skipped"][0]["reason"] == "Contact provenance changed"
-
-
-def test_reply_sync_marks_and_labels_human_reply(tmp_path):
-    db, outreach_id = seeded_database(tmp_path)
-
-    class Mailer:
-        def send(self, recipient, subject, body):
-            return {"message_id": "message-1", "thread_id": "thread-1"}
-
-        def find_reply(self, thread_id, sent_at):
-            return {"automated": False, "received_at": "2026-08-15T10:00:00+00:00"}
-
-        def label_reply(self, thread_id):
-            assert thread_id == "thread-1"
-
-    mailer = Mailer()
-    send_approved([outreach_id], db, mailer)
-    result = sync_replies(db, mailer)
-
-    assert result["human_replies"] == 1
-    assert db.get_outreach(outreach_id)["status"] == "replied"
-
-
-def test_daily_limit_is_enforced_before_mailer_creation(tmp_path, monkeypatch):
-    db, outreach_id = seeded_database(tmp_path)
-    monkeypatch.setattr(db, "sent_today", lambda: 10)
-
-    with pytest.raises(ValueError, match="Daily limit"):
-        send_approved([outreach_id], db, mailer=object())
 
 
 def test_persistent_rate_limit_resets_after_window(tmp_path):
@@ -134,35 +30,6 @@ def test_persistent_rate_limit_resets_after_window(tmp_path):
     assert db.acquire_rate_limit(
         "provider:test", 2, 60, now=start + timedelta(seconds=61)
     ) == (True, 0)
-
-
-def test_send_rate_limit_cannot_be_bypassed_by_stale_sent_count(tmp_path, monkeypatch):
-    db, outreach_id = seeded_database(tmp_path)
-    monkeypatch.setattr(db, "sent_today", lambda: 0)
-    db.acquire_rate_limit("gmail:send", 10, 86_400, units=10)
-
-    result = send_approved([outreach_id], db, mailer=object())
-
-    assert result["sent"] == []
-    assert "Send rate limit reached" in result["skipped"][0]["reason"]
-
-
-def test_queue_requires_application_to_be_marked(tmp_path):
-    db = Database(tmp_path / "agent.db")
-    db.add_source("Acme", "lever", "acme", "https://jobs.lever.co/acme")
-    source = db.list_sources()[0]
-    db.upsert_jobs(
-        source["id"],
-        [{
-            "external_id": "role", "title": "Engineer", "location": "Remote",
-            "description": "Build APIs", "job_url": "https://jobs.lever.co/acme/role",
-            "contact_email": "jobs@acme.test", "contact_source_url": "https://acme.test/jobs",
-        }],
-    )
-    job = db.open_jobs()[0]
-
-    with pytest.raises(ValueError, match="Mark the job as applied"):
-        db.queue_outreach(job["id"], "jobs@acme.test", "https://acme.test/jobs", "Role", "Hello")
 
 
 def test_jooble_discovery_uses_profile_titles(tmp_path, monkeypatch):

@@ -12,8 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from contacts import HunterClient
-from discovery import EMAIL_PATTERN, fetch_source, jooble_jobs
-from gmail_provider import GmailProvider
+from discovery import fetch_source, jooble_jobs
 from matching import FitAssessment, RoleMatcher, hard_filter
 from storage import Database, utcnow
 from workflow import ColdEmailInput, generate_cold_email
@@ -26,7 +25,6 @@ def _positive_env_int(name: str, default: int) -> int:
         return default
 
 
-DAILY_SEND_LIMIT = _positive_env_int("DAILY_SEND_LIMIT", 10)
 DAILY_ENRICHMENT_LIMIT = _positive_env_int("DAILY_ENRICHMENT_LIMIT", 2)
 MONTHLY_HUNTER_LIMIT = _positive_env_int("MONTHLY_HUNTER_LIMIT", 40)
 DAILY_MODEL_SCORING_LIMIT = _positive_env_int("DAILY_MODEL_SCORING_LIMIT", 50)
@@ -35,7 +33,6 @@ JOOBLE_REQUESTS_PER_MINUTE = _positive_env_int("JOOBLE_REQUESTS_PER_MINUTE", 10)
 JOOBLE_REQUESTS_PER_DAY = _positive_env_int("JOOBLE_REQUESTS_PER_DAY", 100)
 ATS_REQUESTS_PER_MINUTE = _positive_env_int("ATS_REQUESTS_PER_MINUTE", 30)
 HUNTER_REQUESTS_PER_MINUTE = _positive_env_int("HUNTER_REQUESTS_PER_MINUTE", 5)
-INBOX_SYNCS_PER_HOUR = _positive_env_int("INBOX_SYNCS_PER_HOUR", 12)
 
 
 def _reserve(db: Database, scope: str, limit: int, seconds: int) -> tuple[bool, int]:
@@ -278,46 +275,6 @@ def personalize_draft(
     return db.get_draft(draft_id) or {}
 
 
-def prepare_queue(db: Database, limit: int = DAILY_SEND_LIMIT) -> int:
-    profile = db.get_profile()
-    if not profile:
-        raise RuntimeError("Save a candidate profile before preparing outreach.")
-    prepared = 0
-    for match in db.ranked_matches():
-        if prepared >= limit:
-            break
-        if (
-            match["decision"] != "qualified"
-            or match["application_status"] != "applied"
-            or not match["selected_contact_email"]
-            or match["outreach_id"]
-        ):
-            continue
-        allowed, _ = _reserve(db, "model:drafting", DAILY_DRAFT_LIMIT, 86_400)
-        if not allowed:
-            break
-        email = generate_cold_email(
-            ColdEmailInput(
-                candidate_name=profile["candidate_name"],
-                company_name=match["company_name"],
-                candidate_profile=profile["candidate_profile"],
-                job_description=match["description"],
-                recipient_name=match["contact_name"] or "",
-                recipient_position=match["contact_position"] or "",
-                role_title=match["title"],
-                applied_at=match["applied_at"] or "",
-            )
-        )
-        subject, body = _split_generated_email(email, match["title"], match["company_name"])
-        db.queue_outreach(
-            match["id"], match["selected_contact_email"],
-            (json.loads(match["contact_sources_json"] or "[]") or [match["contact_source_url"]])[0],
-            subject, body,
-        )
-        prepared += 1
-    return prepared
-
-
 def run_discovery(db: Database | None = None) -> dict[str, Any]:
     database = db or Database()
     started = utcnow()
@@ -335,121 +292,11 @@ def run_discovery(db: Database | None = None) -> dict[str, Any]:
         raise
 
 
-def send_approved(
-    outreach_ids: list[int], db: Database | None = None, mailer: GmailProvider | None = None
-) -> dict[str, Any]:
-    database = db or Database()
-    unique_ids = list(dict.fromkeys(outreach_ids))
-    remaining = DAILY_SEND_LIMIT - database.sent_today()
-    if len(unique_ids) > remaining:
-        raise ValueError(f"Daily limit allows only {remaining} more message(s).")
-    gmail = mailer or GmailProvider()
-    result: dict[str, Any] = {"sent": [], "skipped": [], "failed": []}
-    for outreach_id in unique_ids:
-        row = database.get_outreach(outreach_id)
-        if not row or row["status"] != "queued":
-            result["skipped"].append({"id": outreach_id, "reason": "Not queued"})
-            continue
-        if row["job_status"] != "open":
-            result["skipped"].append({"id": outreach_id, "reason": "Role is closed"})
-            continue
-        if row["application_status"] not in {"applied", "outreach_queued"}:
-            result["skipped"].append({"id": outreach_id, "reason": "Job is not marked applied"})
-            continue
-        if not EMAIL_PATTERN.fullmatch(row["recipient"]):
-            result["skipped"].append({"id": outreach_id, "reason": "Invalid recipient address"})
-            continue
-        if not row["subject"].strip() or not row["body"].strip():
-            result["skipped"].append({"id": outreach_id, "reason": "Subject and message are required"})
-            continue
-        if row["recipient"].lower() != (row["contact_email"] or "").lower() or not row["recipient_source_url"]:
-            result["skipped"].append({"id": outreach_id, "reason": "Contact provenance changed"})
-            continue
-        allowed, retry_after = _reserve(database, "gmail:send", DAILY_SEND_LIMIT, 86_400)
-        if not allowed:
-            result["skipped"].append(
-                {"id": outreach_id, "reason": f"Send rate limit reached; retry in {retry_after} seconds"}
-            )
-            continue
-        try:
-            sent = gmail.send(row["recipient"], row["subject"], row["body"])
-            database.mark_sent(outreach_id, sent["message_id"], sent["thread_id"])
-            result["sent"].append(outreach_id)
-        except Exception as error:
-            database.mark_send_error(outreach_id, str(error))
-            result["failed"].append({"id": outreach_id, "error": str(error)})
-    return result
-
-
-def send_drafts(
-    draft_ids: list[int], db: Database | None = None, mailer: GmailProvider | None = None,
-) -> dict[str, Any]:
-    """Freeze approved drafts into delivery snapshots and send them."""
-
-    database = db or Database()
-    outreach_ids: list[int] = []
-    rejected: list[dict[str, Any]] = []
-    for draft_id in list(dict.fromkeys(draft_ids)):
-        draft = database.get_draft(draft_id)
-        if not draft:
-            rejected.append({"id": draft_id, "reason": "Unknown draft"})
-            continue
-        if draft["job_status"] != "open":
-            rejected.append({"id": draft_id, "reason": "Role is closed"})
-            continue
-        if draft["application_status"] != "applied":
-            rejected.append({"id": draft_id, "reason": "Job is not marked applied"})
-            continue
-        if not draft["subject"].strip() or not draft["body"].strip():
-            rejected.append({"id": draft_id, "reason": "Subject and message are required"})
-            continue
-        try:
-            outreach_ids.append(database.create_outreach_from_draft(draft_id))
-        except ValueError as error:
-            rejected.append({"id": draft_id, "reason": str(error)})
-    if not outreach_ids:
-        return {"sent": [], "skipped": rejected, "failed": []}
-    result = send_approved(outreach_ids, database, mailer)
-    result["skipped"] = rejected + result["skipped"]
-    return result
-
-
-def sync_replies(
-    db: Database | None = None, mailer: GmailProvider | None = None, *, interactive: bool = False
-) -> dict[str, int]:
-    database = db or Database()
-    started = utcnow()
-    totals = {"checked": 0, "human_replies": 0, "automated_replies": 0}
-    try:
-        allowed, retry_after = _reserve(database, "gmail:sync", INBOX_SYNCS_PER_HOUR, 3_600)
-        if not allowed:
-            totals["rate_limited"] = retry_after
-            database.record_run("sync-replies", "rate_limited", str(totals), started)
-            return totals
-        gmail = mailer or GmailProvider(interactive=interactive)
-        for outreach in database.tracked_outreach():
-            if outreach["status"] not in {"sent", "auto_reply"}:
-                continue
-            totals["checked"] += 1
-            reply = gmail.find_reply(outreach["gmail_thread_id"], outreach["sent_at"])
-            if not reply:
-                continue
-            database.mark_reply(outreach["id"], reply["automated"], reply["received_at"])
-            gmail.label_reply(outreach["gmail_thread_id"])
-            totals["automated_replies" if reply["automated"] else "human_replies"] += 1
-        database.record_run("sync-replies", "success", str(totals), started)
-        return totals
-    except Exception as error:
-        database.record_run("sync-replies", "failed", str(error), started)
-        raise
-
-
 def install_scheduler() -> None:
     script = str(Path(__file__).resolve())
     python = sys.executable
     tasks = [
         ("ColdEmailAgent-Discover", "DAILY", "1", "08:00", "discover"),
-        ("ColdEmailAgent-SyncReplies", "MINUTE", "15", None, "sync-replies"),
     ]
     for name, schedule, modifier, start, command in tasks:
         task_command = f'"{python}" "{script}" {command}'
@@ -466,12 +313,10 @@ def install_scheduler() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["discover", "sync-replies", "install-scheduler"])
+    parser.add_argument("command", choices=["discover", "install-scheduler"])
     args = parser.parse_args()
     if args.command == "discover":
         print(run_discovery())
-    elif args.command == "sync-replies":
-        print(sync_replies())
     else:
         install_scheduler()
         print("Windows scheduled tasks installed.")

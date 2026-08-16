@@ -110,6 +110,19 @@ CREATE TABLE IF NOT EXISTS drafts (
     generated_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS manual_drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_name TEXT NOT NULL,
+    company_name TEXT NOT NULL,
+    role_title TEXT NOT NULL DEFAULT '',
+    recipient_name TEXT NOT NULL DEFAULT '',
+    recipient_position TEXT NOT NULL DEFAULT '',
+    candidate_profile TEXT NOT NULL,
+    job_description TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS task_runs (
     id TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
@@ -321,6 +334,45 @@ class Database:
         result = dict(row)
         result["preferences"] = json.loads(result.pop("preferences_json"))
         return result
+
+    def create_manual_draft(self, values: dict[str, str]) -> dict[str, Any]:
+        now = utcnow()
+        with self.connect() as db:
+            cursor = db.execute(
+                """INSERT INTO manual_drafts(
+                candidate_name,company_name,role_title,recipient_name,recipient_position,
+                candidate_profile,job_description,body,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    values["candidate_name"].strip(), values["company_name"].strip(),
+                    values.get("role_title", "").strip(), values.get("recipient_name", "").strip(),
+                    values.get("recipient_position", "").strip(), values["candidate_profile"].strip(),
+                    values["job_description"].strip(), values["body"].strip(), now, now,
+                ),
+            )
+            row = db.execute("SELECT * FROM manual_drafts WHERE id=?", (cursor.lastrowid,)).fetchone()
+        return dict(row)
+
+    def list_manual_drafts(self) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM manual_drafts ORDER BY updated_at DESC, id DESC").fetchall()
+        return [dict(row) for row in rows]
+
+    def update_manual_draft(self, draft_id: int, body: str) -> dict[str, Any]:
+        with self.connect() as db:
+            changed = db.execute(
+                "UPDATE manual_drafts SET body=?,updated_at=? WHERE id=?",
+                (body.strip(), utcnow(), draft_id),
+            ).rowcount
+            if not changed:
+                raise ValueError("Saved draft not found.")
+            row = db.execute("SELECT * FROM manual_drafts WHERE id=?", (draft_id,)).fetchone()
+        return dict(row)
+
+    def delete_manual_draft(self, draft_id: int) -> None:
+        with self.connect() as db:
+            if not db.execute("DELETE FROM manual_drafts WHERE id=?", (draft_id,)).rowcount:
+                raise ValueError("Saved draft not found.")
 
     def add_source(self, company: str, provider: str, token: str, url: str) -> None:
         with self.connect() as db:
@@ -837,8 +889,7 @@ class Database:
                 (SELECT COUNT(*) FROM matches JOIN jobs ON jobs.id=matches.job_id
                     WHERE matches.decision='qualified' AND jobs.status='open') AS qualified,
                 (SELECT COUNT(*) FROM drafts WHERE status='draft') AS queued,
-                (SELECT COUNT(*) FROM outreach WHERE status IN ('sent','replied','auto_reply')) AS sent,
-                (SELECT COUNT(*) FROM outreach WHERE status='replied') AS replies,
+                (SELECT COUNT(*) FROM manual_drafts) AS saved_drafts,
                 (SELECT COUNT(*) FROM jobs WHERE application_status='applied') AS applied"""
             ).fetchone()
         return {key: int(row[key]) for key in row.keys()}

@@ -22,26 +22,15 @@ export type Match = {
   draft_id?: number; draft_status?: string; selected_contact_email?: string
 }
 
-export type Blocker = { code: string; message: string }
-export type ApprovalItem = {
-  id: number; job_id: number; title: string; company_name: string; location: string
-  score: number; subject: string; body: string; edited: number; stale: number
-  display_state: 'Draft ready' | 'Contact pending' | 'Ready after application' | 'Ready to send' | 'Sent'
-  can_send: boolean; blockers: Blocker[]; application_status: string; applied_at?: string
-  apply_url: string; job_url: string; selected_contact_email?: string; contact_name?: string
-  contact_position?: string; contact_confidence?: number; contact_source_kind?: string
-  contact_sources: string[]; evidence: string[]; missing: string[]
+export type ManualDraft = {
+  id: number; candidate_name: string; company_name: string; role_title: string
+  recipient_name: string; recipient_position: string; candidate_profile: string
+  job_description: string; body: string; created_at: string; updated_at: string
 }
 
-export type Dashboard = {
-  open_roles: number; qualified: number; queued: number; sent: number; replies: number; applied: number
-}
+export type Dashboard = { open_roles: number; qualified: number; queued: number; saved_drafts: number; applied: number }
 
-export type Settings = {
-  gmail: { connected: boolean; client_configured: boolean }
-  providers: Record<string, boolean>
-  quotas: Record<string, { used: number; limit: number }>
-}
+export type Settings = { providers: Record<string, boolean>; quotas: Record<string, { used: number; limit: number }> }
 
 export class ApiError extends Error {
   status: number
@@ -71,17 +60,12 @@ export const api = {
   startDiscovery: () => request<DiscoveryRun>('/api/discovery-runs', { method: 'POST' }),
   discoveryRun: (id: string) => request<DiscoveryRun>(`/api/discovery-runs/${id}`),
   matches: (query = '') => request<{ items: Match[]; total: number }>(`/api/matches${query}`),
-  approvals: () => request<ApprovalItem[]>('/api/approval-items'),
-  saveDraft: (id: number, data: { subject: string; body: string }) => request<ApprovalItem>(`/api/drafts/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
-  regenerate: (id: number) => request<ApprovalItem>(`/api/drafts/${id}/regenerate`, { method: 'POST' }),
-  markApplied: (id: number) => request(`/api/jobs/${id}/mark-applied`, { method: 'POST' }),
-  findContact: (id: number) => request(`/api/jobs/${id}/find-contact`, { method: 'POST' }),
-  send: (ids: number[]) => request<{ sent: number[]; skipped: unknown[]; failed: unknown[] }>('/api/outreach/send', { method: 'POST', body: JSON.stringify({ draft_ids: ids, confirmed: true }) }),
-  conversations: () => request<Record<string, unknown>[]>('/api/conversations'),
-  syncReplies: () => request<Record<string, number>>('/api/replies/sync', { method: 'POST' }),
-  connectGmail: () => request('/api/gmail/connect', { method: 'POST' }),
   settings: () => request<Settings>('/api/settings/status'),
   manualDraft: (data: Record<string, string>) => request<{ body: string }>('/api/manual-draft', { method: 'POST', body: JSON.stringify(data) }),
+  manualDrafts: () => request<ManualDraft[]>('/api/manual-drafts'),
+  saveManualDraft: (data: Record<string, string>) => request<ManualDraft>('/api/manual-drafts', { method: 'POST', body: JSON.stringify(data) }),
+  updateManualDraft: (id: number, body: string) => request<ManualDraft>(`/api/manual-drafts/${id}`, { method: 'PATCH', body: JSON.stringify({ body }) }),
+  deleteManualDraft: (id: number) => request<void>(`/api/manual-drafts/${id}`, { method: 'DELETE' }),
   extractDocument: async (file: File) => {
     const bytes = new Uint8Array(await file.arrayBuffer())
     let binary = ''

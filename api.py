@@ -18,20 +18,14 @@ from pydantic import BaseModel, Field, model_validator
 
 from automation import (
     DAILY_ENRICHMENT_LIMIT,
-    DAILY_SEND_LIMIT,
     MONTHLY_HUNTER_LIMIT,
     discover,
     enrich_applied_jobs,
     evaluate_matches,
-    find_contact_for_job,
-    personalize_draft,
     prepare_drafts,
-    send_drafts,
-    sync_replies,
 )
 from discovery import infer_source
 from document_input import DocumentInputError, extract_pdf_text
-from gmail_provider import CLIENT_SECRET, TOKEN_FILE, GmailProvider
 from storage import Database
 from workflow import ColdEmailInput, generate_cold_email
 
@@ -56,16 +50,6 @@ class SourcePatch(BaseModel):
     enabled: bool | None = None
 
 
-class DraftPatch(BaseModel):
-    subject: str
-    body: str
-
-
-class SendPayload(BaseModel):
-    draft_ids: list[int] = Field(min_length=1)
-    confirmed: bool
-
-
 class ManualDraftPayload(BaseModel):
     candidate_name: str = Field(min_length=1)
     company_name: str = Field(min_length=1)
@@ -75,6 +59,14 @@ class ManualDraftPayload(BaseModel):
     recipient_position: str = ""
     role_title: str = ""
     applied_at: str = ""
+
+
+class SavedManualDraftPayload(ManualDraftPayload):
+    body: str = Field(min_length=1)
+
+
+class SavedManualDraftPatch(BaseModel):
+    body: str = Field(min_length=1)
 
 
 class EmptyPayload(BaseModel):
@@ -205,136 +197,21 @@ def create_app(database: Database | None = None) -> FastAPI:
         items = [_decode(row, "evidence_json", "missing_json") for row in rows]
         return {"items": items, "total": total, "page": page, "page_size": page_size}
 
-    def approval_item(row: dict[str, Any]) -> dict[str, Any]:
-        blockers: list[dict[str, str]] = []
-        if row["job_status"] != "open":
-            blockers.append({"code": "role_closed", "message": "The role is no longer open."})
-        if row["application_status"] != "applied":
-            blockers.append({"code": "application_required", "message": "Mark this role as applied."})
-        if not row["selected_contact_email"]:
-            blockers.append({"code": "contact_required", "message": "A verified contact is still needed."})
-        sources = json.loads(row.get("contact_sources_json") or "[]")
-        if row["selected_contact_email"] and (not row["contact_source_kind"] or not sources):
-            blockers.append({"code": "contact_provenance_missing", "message": "Contact source evidence is missing."})
-        if not row["subject"].strip() or not row["body"].strip():
-            blockers.append({"code": "draft_incomplete", "message": "Subject and message are required."})
-        if row["sent_count"]:
-            blockers.append({"code": "duplicate_send", "message": "Outreach was already sent for this role."})
-        if db.sent_today() >= DAILY_SEND_LIMIT:
-            blockers.append({"code": "gmail_daily_limit", "message": "The daily Gmail limit is full."})
-        can_send = not blockers
-        if row["status"] == "sent" or row["sent_count"]:
-            state = "Sent"
-        elif not row["selected_contact_email"]:
-            state = "Contact pending"
-        elif row["application_status"] != "applied":
-            state = "Ready after application"
-        elif can_send:
-            state = "Ready to send"
-        else:
-            state = "Draft ready"
-        item = _decode(row, "evidence_json", "missing_json")
-        item["contact_sources"] = sources
-        item["can_send"] = can_send
-        item["blockers"] = blockers
-        item["display_state"] = state
-        return item
-
-    @app.get("/api/approval-items")
-    def get_approval_items() -> list[dict[str, Any]]:
-        return [approval_item(row) for row in db.approval_items()]
-
-    @app.patch("/api/drafts/{draft_id}")
-    def patch_draft(draft_id: int, payload: DraftPatch) -> dict[str, Any]:
-        try:
-            db.edit_draft(draft_id, payload.subject, payload.body)
-        except ValueError as error:
-            raise HTTPException(404, str(error)) from error
-        row = next(item for item in db.approval_items() if item["id"] == draft_id)
-        return approval_item(row)
-
-    @app.post("/api/drafts/{draft_id}/regenerate")
-    def regenerate_draft(draft_id: int) -> dict[str, Any]:
-        try:
-            draft = db.get_draft(draft_id)
-            if not draft:
-                raise ValueError("Unknown draft.")
-            prepare_drafts(db, limit=1, force_job_id=draft["job_id"])
-        except ValueError as error:
-            raise HTTPException(400, str(error)) from error
-        row = next(item for item in db.approval_items() if item["id"] == draft_id)
-        return approval_item(row)
-
-    @app.post("/api/jobs/{job_id}/mark-applied")
-    def mark_applied(job_id: int) -> dict[str, Any]:
-        try:
-            db.mark_applied(job_id)
-        except ValueError as error:
-            raise HTTPException(400, str(error)) from error
-        return {"job_id": job_id, "application_status": "applied"}
-
-    @app.post("/api/jobs/{job_id}/find-contact")
-    def find_contact(job_id: int) -> dict[str, Any]:
-        try:
-            contact = find_contact_for_job(db, job_id)
-            draft = next((item for item in db.approval_items() if item["job_id"] == job_id), None)
-            if contact and draft:
-                if draft["edited"]:
-                    db.mark_draft_stale(job_id)
-                else:
-                    personalize_draft(db, draft["id"])
-            return {"contact": contact, "draft_preserved": bool(draft and draft["edited"])}
-        except ValueError as error:
-            raise HTTPException(400, str(error)) from error
-
-    @app.post("/api/outreach/send")
-    def send_outreach(payload: SendPayload) -> dict[str, Any]:
-        if not payload.confirmed:
-            raise HTTPException(400, "Explicit batch confirmation is required.")
-        try:
-            result = send_drafts(payload.draft_ids, db)
-        except ValueError as error:
-            raise HTTPException(400, str(error)) from error
-        if result["skipped"] and not result["sent"] and not result["failed"]:
-            raise HTTPException(409, detail={"message": "No drafts were sendable.", "result": result})
-        return result
-
     @app.get("/api/dashboard")
     def dashboard() -> dict[str, Any]:
         stats = db.dashboard_stats()
         latest = db.last_run("discover")
         return {**stats, "latest_discovery": latest}
 
-    @app.get("/api/conversations")
-    def conversations() -> list[dict[str, Any]]:
-        return db.tracked_outreach()
-
-    @app.post("/api/replies/sync")
-    def reply_sync() -> dict[str, int]:
-        try:
-            return sync_replies(db, interactive=False)
-        except Exception as error:
-            raise HTTPException(400, str(error)) from error
-
-    @app.post("/api/gmail/connect")
-    def gmail_connect() -> dict[str, Any]:
-        try:
-            gmail = GmailProvider(interactive=True)
-            return {"connected": True, "email": gmail.account_email}
-        except Exception as error:
-            raise HTTPException(400, str(error)) from error
-
     @app.get("/api/settings/status")
     def settings_status() -> dict[str, Any]:
         return {
-            "gmail": {"connected": TOKEN_FILE.exists(), "client_configured": CLIENT_SECRET.exists()},
             "providers": {
                 "groq": bool(os.getenv("GROQ_API_KEY", "").strip()),
                 "jooble": bool(os.getenv("JOOBLE_API_KEY", "").strip()),
                 "hunter": bool(os.getenv("HUNTER_API_KEY", "").strip()),
             },
             "quotas": {
-                "gmail": {"used": db.sent_today(), "limit": DAILY_SEND_LIMIT},
                 "hunter_daily": {"used": db.enrichment_attempts_today(), "limit": DAILY_ENRICHMENT_LIMIT},
                 "hunter_monthly": {"used": db.hunter_usage(), "limit": MONTHLY_HUNTER_LIMIT},
             },
@@ -344,6 +221,28 @@ def create_app(database: Database | None = None) -> FastAPI:
     def manual_draft(payload: ManualDraftPayload) -> dict[str, str]:
         email = generate_cold_email(ColdEmailInput(**payload.model_dump()))
         return {"body": email}
+
+    @app.get("/api/manual-drafts")
+    def get_manual_drafts() -> list[dict[str, Any]]:
+        return db.list_manual_drafts()
+
+    @app.post("/api/manual-drafts", status_code=status.HTTP_201_CREATED)
+    def save_manual_draft(payload: SavedManualDraftPayload) -> dict[str, Any]:
+        return db.create_manual_draft(payload.model_dump())
+
+    @app.patch("/api/manual-drafts/{draft_id}")
+    def patch_manual_draft(draft_id: int, payload: SavedManualDraftPatch) -> dict[str, Any]:
+        try:
+            return db.update_manual_draft(draft_id, payload.body)
+        except ValueError as error:
+            raise HTTPException(404, str(error)) from error
+
+    @app.delete("/api/manual-drafts/{draft_id}", status_code=status.HTTP_204_NO_CONTENT)
+    def delete_manual_draft(draft_id: int) -> None:
+        try:
+            db.delete_manual_draft(draft_id)
+        except ValueError as error:
+            raise HTTPException(404, str(error)) from error
 
     @app.post("/api/documents/extract")
     def extract_document(payload: DocumentPayload) -> dict[str, str]:
@@ -358,6 +257,10 @@ def create_app(database: Database | None = None) -> FastAPI:
     @app.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.api_route("/api/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+    def unknown_api_route(full_path: str) -> None:
+        raise HTTPException(404, "API route not found.")
 
     if FRONTEND_DIST.exists():
         assets = FRONTEND_DIST / "assets"
